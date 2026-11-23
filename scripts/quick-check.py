@@ -7,6 +7,8 @@ from types import SimpleNamespace
 
 HERE = Path(__file__).resolve().parent
 MAX_ROOTS, MAX_CLOSURE = 8, 2000
+COMMENT = re.compile(r'/-|--[^\n]*')
+BLOCK_DELIMITER = re.compile(r'/-|-/')
 
 def load(name, path):
     spec = importlib.util.spec_from_file_location(name, path)
@@ -27,18 +29,22 @@ def runner(identifier):
 
 def imports(path):
     if path.stat().st_size > 4 * 1024**2: raise ValueError('source/header exceeds quick-check limit')
-    text = path.read_text(); depth = 0; cleaned = []; i = 0
-    # Only the header is needed; preserve line positions across nested comments.
-    while i < len(text):
-        if text.startswith('/-', i): depth += 1; i += 2
-        elif depth and text.startswith('-/', i): depth -= 1; i += 2
-        elif not depth and text.startswith('--', i):
-            end = text.find('\n', i); i = len(text) if end < 0 else end
-        elif depth:
-            if text[i] == '\n': cleaned.append('\n')
-            i += 1
-        else: cleaned.append(text[i]); i += 1
+    text = path.read_text()
+    cleaned = []
+    start = depth = 0
+    # Copy spans of source between comments. Inside a block comment only its
+    # nested delimiters and line breaks affect the header.
+    while match := (BLOCK_DELIMITER if depth else COMMENT).search(text, start):
+        if depth:
+            cleaned.append('\n' * text.count('\n', start, match.start()))
+            depth += 1 if match[0] == '/-' else -1
+        else:
+            cleaned.append(text[start:match.start()])
+            if text.startswith('/-', match.start()):
+                depth = 1
+        start = match.end()
     if depth: raise ValueError('unterminated header/source comment')
+    cleaned.append(text[start:])
     result = []
     for line in ''.join(cleaned).splitlines():
         line = line.strip()
