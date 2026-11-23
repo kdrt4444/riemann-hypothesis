@@ -1,0 +1,89 @@
+name: Check Vandermonde log-ratio bounds
+
+on:
+  push:
+    branches: [verify/vandermonde-bound-imports]
+    paths: [.github/workflows/verify-vandermonde-bounds.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 35
+    env:
+      BASE: ef349ac02c55f6fa50f7e8c1db3a5cbe2218e927
+      FEATURE: b29a3ec522447909e8c959d2fa6a258921ff6ccc
+      LEAN_NUM_THREADS: "1"
+      LAKE_ARTIFACT_CACHE: "false"
+      LAKE_RESTORE_ARTIFACTS: "false"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /lean-toolchain
+            /lakefile.toml
+            /lake-manifest.json
+            /src/Formalism/LogVandermondeBounds/LogRatio*Bound.lean
+
+      - name: Set up the pinned toolchain and fetch the required Mathlib artifacts
+        env:
+          MATHLIB_CACHE_GET_URL: https://cache.mathlib.org/mathlib4
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -o "$RUNNER_TEMP/elan-init.sh"
+          sh "$RUNNER_TEMP/elan-init.sh" -y --default-toolchain none
+          export PATH="$HOME/.elan/bin:$PATH"
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          elan toolchain install "$(cat lean-toolchain)"
+          ulimit -n 65536
+          dir=src/Formalism/LogVandermondeBounds
+          mapfile -t modules < <(for file in "$dir"/LogRatio*Bound.lean; do git show "$BASE:$file"; done | awk '/^(public )?import / {print $NF}' | sort -u)
+          test "${#modules[@]}" -ge 40
+          lake exe mathlib/cache get "${modules[@]}"
+
+      - name: Build both edited modules through Lake
+        run: |
+          ulimit -n 65536
+          lake build +Formalism.LogVandermondeBounds.LogRatioLowerBound +Formalism.LogVandermondeBounds.LogRatioUpperBound
+
+      - name: Compare fresh single-threaded Lean runs against the parent
+        run: |
+          ulimit -n 65536
+          lake env python3 - <<'PY'
+          from pathlib import Path
+          import os
+          import statistics
+          import subprocess
+          import time
+
+          root = Path("src")
+          for path in sorted(root.glob("Formalism/LogVandermondeBounds/LogRatio*Bound.lean")):
+              originals = {
+                  key: subprocess.check_output(["git", "show", f"{os.environ[key]}:{path.as_posix()}"])
+                  for key in ("BASE", "FEATURE")
+              }
+              marker = b"@[expose] public section\n"
+              assert originals["BASE"].split(marker)[1] == originals["FEATURE"].split(marker)[1]
+              times = {"BASE": [], "FEATURE": []}
+              artifact = Path(os.environ["RUNNER_TEMP"]) / f"{path.stem}.olean"
+              for pair in range(5):
+                  order = ("BASE", "FEATURE") if pair % 2 == 0 else ("FEATURE", "BASE")
+                  for key in order:
+                      path.write_bytes(originals[key])
+                      start = time.perf_counter()
+                      subprocess.run(["lean", "-DautoImplicit=false", "-DrelaxedAutoImplicit=false",
+                                      "-DmaxSynthPendingDepth=3", "-DmaxHeartbeats=4000000", "--tstack=400000",
+                                      "-o", str(artifact), str(path.relative_to(root))], cwd=root, check=True)
+                      elapsed = time.perf_counter() - start
+                      if pair:
+                          times[key].append(elapsed)
+              path.write_bytes(originals["FEATURE"])
+              print(path.stem, {key: {"median_seconds": round(statistics.median(samples), 3),
+                                      "samples": [round(t, 3) for t in samples]}
+                                for key, samples in times.items()}, flush=True)
+          PY
